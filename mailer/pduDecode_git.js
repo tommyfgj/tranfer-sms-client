@@ -1054,6 +1054,16 @@ var CdmaPDUHelper = {
           // Decode message based on encoding
           var numFields = bitBuffer.readBits(8);
           debug("Text Length: " + numFields);
+          if (bearerData.userHeader == 1 && bearerData.msgEncoding == 4) {
+              numFields -= 3
+              udhl = bitBuffer.readBits(8);
+              debug("UDHL: " + udhl);
+              bitBuffer.readBits(24);
+              totalsms = bitBuffer.readBits(8);
+              currsms = bitBuffer.readBits(8);
+              debug("total sms: " + totalsms + ", current sms: " + currsms);
+              bearerData.message  = (bearerData.message || "") + "(" + currsms + "/" + totalsms + ")"
+          }
           bearerData.message = (bearerData.message || "") + this.messageDecoder(bearerData.msgEncoding, numFields);
           debug( "Message: \"" + bearerData.message + "\"");
           break;
