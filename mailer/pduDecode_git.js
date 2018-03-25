@@ -8,11 +8,35 @@ var path = require('path');
 var querystring = require('querystring');
 var mailer = require('./sendmail.js');
 
+var cron = require("node-schedule");
+
+const NodeCache = require("node-cache");
+
+var smsCache = new NodeCache({checkperiod: 5, errorOnMissing: true, stdTTL: 600});
+
 //2.创建服务器
 var app = http.createServer();
 
 var pduReg = /^[0-9a-zA-Z][0-9a-zA-Z]+[0-9a-zA-Z]$/;
 var logger = require('tracer').dailyfile({root:'../logs', maxLogFiles: 10, allLogsFileName: 'mailer', level: 'info'});
+
+
+var rule1     = new cron.RecurrenceRule();  
+var times1    = [1,6,11,16,21,26,31,36,41,46,51,56];  
+rule1.second  = times1;  
+cron.scheduleJob(rule1, function(){  
+  listAllKeys();  
+  assembleSms();
+});  
+
+
+smsCache.on( "expired", function( key, value ){
+  keyHeaders = key.split("|");
+    if (keyHeaders.length == 3) {
+      value.msg.longTextFlag = 0;
+      decoderOutput(value.msg);
+    }
+});
 
 //3.添加响应事件
 app.on('request', function (req, res) {
@@ -72,6 +96,64 @@ function debug(msg) {
   }
 }
 
+function listAllKeys() {
+  allkeys = smsCache.keys();
+  console.log(allkeys);
+  for (i = 0; i < allkeys.length; i++) {
+    //console.log(allkeys[i]);
+    //console.log(smsCache.get(allkeys[i]));
+  }
+}
+
+function deleteCacheSms(reference, totalsms) {
+  for (i = 1; i <= totalsms; i++) {
+    smsCache.del(reference + '|' + totalsms + '|' + i);
+  }
+}
+
+function assembleSms() {
+  allkeys = smsCache.keys();
+  var countArr = new NodeCache();
+  for (i = 0; i < allkeys.length; i++) {
+    keyHeaders = allkeys[i].split("|");
+    if (keyHeaders.length != 3) {
+      console.log(allkeys[i] + " is illegal, delete and skip...");
+      logger.warn(allkeys[i] + " is illegal, delete and skip...");
+      smsCache.del(allkeys[i]);
+      continue;
+    }
+    countArr.set(keyHeaders[0], keyHeaders[1]);
+  }
+  countArrKeys = countArr.keys();
+  for (i = 0; i < countArrKeys.length; i++) {
+    var ret = {};
+    ret.full = 1;
+    ret.text = '';
+    reference = countArrKeys[i];
+    totalsms = countArr.get(countArrKeys[i]);
+    for (j = 1; j <= totalsms; j++) {
+      try{
+        sms = smsCache.get(reference + '|' + totalsms + '|' + j, true );
+        ret.text += sms.msg.body;
+        ret.msg = sms.msg
+      } catch(err){
+        //console.log(err);
+        ret.full = 0;
+        break;
+      }
+    }
+    if (ret.full === 1) {
+      fullmsg = ret.msg;
+      fullmsg.longTextFlag = 0;
+      fullmsg.body = ret.text;
+      //console.log(fullmsg);
+      decoderOutput(fullmsg);
+      deleteCacheSms(reference, totalsms);
+    }
+  }
+  countArr.close();
+}
+
 function Decode(pdu) {
   Buf.processIncoming(pdu);
   var message = CdmaPDUHelper.readMessage();
@@ -79,10 +161,14 @@ function Decode(pdu) {
 }
 
 function decoderOutput(msg) {
-	mailer.sendMail(msg.sender + "@example.org", "xxx@163.com", msg.sender, msg.sender + "@example.org", msg.body);
-	obj = {delivery: msg.delivery, deliveryStatus: msg.deliveryStatus, sender: msg.sender, receiver: msg.receiver, timestamp: msg.timestamp, messageClass: msg.messageClass, body: msg.body}
+  console.log("longTextFlag" + msg.longTextFlag);
+  if (msg.longTextFlag === 0) {
+      mailer.sendMail(msg.sender + "@example.org", "xxx@163.com", msg.sender, msg.sender + "@example.org", msg.body);
+  }
+	obj = {longTextFlag: msg.longTextFlag, delivery: msg.delivery, deliveryStatus: msg.deliveryStatus, sender: msg.sender, receiver: msg.receiver, timestamp: msg.timestamp, messageClass: msg.messageClass, body: msg.body}
 	return JSON.stringify(obj);	
 }
+
 
 var Buf = {
   incomingBytes: [],
@@ -480,6 +566,7 @@ var pduHelper = {
 var CdmaPDUHelper = {
   dtmfChars: "D1234567890*#ABC",
 
+
   /**
    * Entry point for SMS encoding
    */
@@ -533,6 +620,11 @@ var CdmaPDUHelper = {
       timestamp: options.timestamp,
       priority: options.priority
     });
+  },
+
+  longtextWriteToCache: function longtextWriteToCache(ref, text){
+
+
   },
 
   smsParameterEncoder: function smsParameterEncoder(id, data) {
@@ -805,15 +897,18 @@ var CdmaPDUHelper = {
       pduSize -= (this.smsParameterDecoder(parameterId, msg) + 2);
     }
 
-    // Return same object structure as GSM
-    return {delivery: msgTypeMap[msg.bearerData.msgType],
+    ret = {delivery: msgTypeMap[msg.bearerData.msgType],
             deliveryStatus: msg.bearerData.responseCode || 0,
             sender: msg.originAddr, // + msg.originSubAddr
             receiver: msg.destAddr, // + msg.destSubAddr
             messageClass: priorityMap[(msg.bearerData.priority || 0)],
             timestamp: msg.bearerData.timestamp,
-            body: msg.bearerData.message
+            body: msg.bearerData.message,
+            longTextFlag: msg.bearerData.longTextFlag
             };
+    this.setSmsCache(ret, msg.bearerData.reference, msg.bearerData.totalsms, msg.bearerData.currsms);
+    // Return same object structure as GSM
+    return ret;
   },
 
   /*
@@ -978,6 +1073,12 @@ var CdmaPDUHelper = {
     return length;
   },
 
+  setSmsCache: function setSmsCache(msg, reference, total, index) {
+    var timestamp = Math.round(new Date().getTime()/1000);
+    obj = {ts: timestamp, msg: msg, reference: reference, total: total, index: index};
+    smsCache.set(reference + '|' + total + '|' + index, obj);
+  },
+
   messageDecoder: function messageDecoder(encoding, msgSize) {
     var message = "",
         msgDigit = 0;
@@ -1019,9 +1120,12 @@ var CdmaPDUHelper = {
     return message;
   },
 
+
+
   smsSubparameterDecoder: function smsSubparameterDecoder(dataBufSize) {
     var bearerData = {},
         remainBufSize = dataBufSize;  // In bytes
+    bearerData.longTextFlag = 0;
     while (remainBufSize > 0) {
       // Fixed header
       var id = bitBuffer.readBits(8),
@@ -1058,13 +1162,18 @@ var CdmaPDUHelper = {
               numFields -= 3
               udhl = bitBuffer.readBits(8);
               debug("UDHL: " + udhl);
-              bitBuffer.readBits(24);
+              bitBuffer.readBits(16);
+              reference = bitBuffer.readBits(8);
               totalsms = bitBuffer.readBits(8);
               currsms = bitBuffer.readBits(8);
               debug("total sms: " + totalsms + ", current sms: " + currsms);
-              bearerData.message  = (bearerData.message || "") + "(" + currsms + "/" + totalsms + ")"
+              bearerData.longTextFlag = 1;
+              bearerData.reference = reference;
+              bearerData.totalsms = totalsms;
+              bearerData.currsms = currsms;
           }
           bearerData.message = (bearerData.message || "") + this.messageDecoder(bearerData.msgEncoding, numFields);
+ 
           debug( "Message: \"" + bearerData.message + "\"");
           break;
         case 2: // User Response Code, C.S0015-B v2.0, 4.5.3
